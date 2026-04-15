@@ -43,7 +43,7 @@ class FERDataset(Dataset):
             self.images.extend(images_for_emotion)
             self.labels.extend([label_idx] * len(images_for_emotion))
             
-        assert len(self.images) == len(self.labels)
+        assert len(self.images) == len(self.labels), f"There are {len(self.images)} images but {len(self.labels)} labels"
 
 
     def __getitem__(self, index):
