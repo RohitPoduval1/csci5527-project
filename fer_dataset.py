@@ -1,6 +1,6 @@
 from pathlib import Path
 from torch.utils.data import Dataset
-from PIL import Image # Required to read the actual image file
+from PIL import Image
 
 
 class FERDataset(Dataset):
