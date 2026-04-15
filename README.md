@@ -22,5 +22,7 @@ In Colab, run the following:
 import sys
 
 sys.path.append('/content/csci5527-project')
+
+# Import FERDataset and use like a normal Dataset
 from fer_dataset import FERDataset
 ```
