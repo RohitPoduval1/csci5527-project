@@ -36,7 +36,7 @@ class FERDataset(Dataset):
         
         for emotion in self.classes:
             emotion_dir = split_path / emotion
-            images_for_emotion = list(emotion_dir.glob('*.jpg'))
+            images_for_emotion = sorted(emotion_dir.glob('*.jpg'))
             
             label_idx = self.class_to_idx[emotion]
             
