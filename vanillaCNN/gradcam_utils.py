@@ -1,238 +1,254 @@
-"""Grad-CAM helpers for the FER2013 vanilla CNN notebook.
-
-This module is intentionally notebook-friendly: import the pieces you need and
-use them directly with ``model_vanilla`` or ``model_best``.
-"""
-
-from __future__ import annotations
-
-from typing import Iterable, Optional, Sequence
-
-import matplotlib.cm as cm
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 
-def get_last_conv_layer(model: nn.Module) -> nn.Conv2d:
-    """Return the last convolutional layer in a model."""
-    last_conv: Optional[nn.Conv2d] = None
+def get_default_target_layer(model):
+    """Return the last convolution layer in a CNN."""
+    last_conv = None
     for module in model.modules():
-        if isinstance(module, nn.Conv2d):
+        if isinstance(module, torch.nn.Conv2d):
             last_conv = module
     if last_conv is None:
-        raise ValueError("Grad-CAM needs at least one nn.Conv2d layer.")
+        raise ValueError("Grad-CAM needs at least one Conv2d layer.")
     return last_conv
 
+def gradcam_one_image(model, image_tensor, target_layer, class_names=None, device="cuda"):
+    """
+    Minimal Grad-CAM for a FER-style CNN.
 
-def _to_class_index_tensor(
-    class_idx: Optional[Sequence[int] | torch.Tensor | int],
-    batch_size: int,
-    device: torch.device,
-) -> Optional[torch.Tensor]:
-    """Normalize class indices into a 1D tensor on the right device."""
-    if class_idx is None:
-        return None
-    if isinstance(class_idx, int):
-        return torch.full((batch_size,), class_idx, device=device, dtype=torch.long)
-    if isinstance(class_idx, torch.Tensor):
-        return class_idx.to(device=device, dtype=torch.long).view(-1)
-    if isinstance(class_idx, Iterable):
-        return torch.tensor(list(class_idx), device=device, dtype=torch.long).view(-1)
-    raise TypeError("class_idx must be None, an int, a tensor, or a sequence of ints.")
+    Args:
+        model: trained CNN
+        image_tensor: single image, shape [1, H, W] or [C, H, W]
+        target_layer: the conv layer to hook
+        class_names: optional list of class names
+        device: "cuda" or "cpu"
 
+    Returns:
+        cam: heatmap in [0,1], shape [H, W]
+        pred_idx: predicted class index
+        pred_prob: predicted probability
+        image_np: denormalized grayscale image in [0,1]
+    """
+    model.eval()
+    model.to(device)
 
-class GradCAM:
-    """Minimal Grad-CAM implementation for CNN classifiers."""
+    # Ensure batch dimension
+    if image_tensor.ndim == 3:
+        input_tensor = image_tensor.unsqueeze(0).to(device)
+    else:
+        raise ValueError("image_tensor should have shape [C, H, W]")
 
-    def __init__(self, model: nn.Module, target_layer: Optional[nn.Module] = None) -> None:
-        self.model = model
-        self.target_layer = target_layer if target_layer is not None else get_last_conv_layer(model)
-        self.activations: Optional[torch.Tensor] = None
-        self.gradients: Optional[torch.Tensor] = None
-        self._handles = [self.target_layer.register_forward_hook(self._forward_hook)]
+    activations = None
+    gradients = None
 
-    def _save_gradient(self, grad: torch.Tensor) -> None:
-        self.gradients = grad.detach()
+    def forward_hook(module, inp, out):
+        nonlocal activations
+        activations = out
 
-    def _forward_hook(self, module: nn.Module, inputs: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
-        if not isinstance(output, torch.Tensor):
-            raise TypeError("Grad-CAM target layer must return a tensor output.")
-        self.activations = output.detach()
-        output.register_hook(self._save_gradient)
+    def backward_hook(module, grad_in, grad_out):
+        nonlocal gradients
+        gradients = grad_out[0]
 
-    def close(self) -> None:
-        """Remove hooks and release references."""
-        for handle in self._handles:
-            handle.remove()
-        self._handles.clear()
-        self.activations = None
-        self.gradients = None
+    h1 = target_layer.register_forward_hook(forward_hook)
+    h2 = target_layer.register_full_backward_hook(backward_hook)
 
-    def __enter__(self) -> "GradCAM":
-        return self
+    # Forward
+    logits = model(input_tensor)
+    probs = torch.softmax(logits, dim=1)
+    pred_idx = logits.argmax(dim=1).item()
+    pred_prob = probs[0, pred_idx].item()
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close()
+    # Backward on predicted class
+    model.zero_grad()
+    logits[0, pred_idx].backward()
 
-    def generate(
-        self,
-        input_tensor: torch.Tensor,
-        class_idx: Optional[Sequence[int] | torch.Tensor | int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute Grad-CAM heatmaps.
+    # Grad-CAM
+    weights = gradients.mean(dim=(2, 3), keepdim=True)          # [1, C, 1, 1]
+    cam = (weights * activations).sum(dim=1, keepdim=True)      # [1, 1, h, w]
+    cam = F.relu(cam)
+    cam = F.interpolate(cam, size=input_tensor.shape[-2:], mode="bilinear", align_corners=False)
+    cam = cam.squeeze().detach().cpu()
 
-        Returns:
-            cam_map: shape ``[batch, height, width]`` normalized to ``[0, 1]``
-            class_idx: shape ``[batch]``
-            logits: detached model outputs
-        """
-        if input_tensor.ndim != 4:
-            raise ValueError("input_tensor must have shape [batch, channels, height, width].")
+    # Normalize to [0,1]
+    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+    cam = cam.numpy()
 
-        was_training = self.model.training
-        self.model.eval()
-        self.model.zero_grad(set_to_none=True)
+    # FER images are often normalized with mean=0.5, std=0.5
+    image_np = input_tensor[0, 0].detach().cpu() * 0.5 + 0.5
+    image_np = image_np.clamp(0, 1).numpy()
 
-        logits = self.model(input_tensor)
-        class_tensor = _to_class_index_tensor(class_idx, logits.size(0), logits.device)
-        if class_tensor is None:
-            class_tensor = logits.argmax(dim=1)
-        if class_tensor.numel() != logits.size(0):
-            raise ValueError("class_idx must provide one class index per batch element.")
+    h1.remove()
+    h2.remove()
 
-        target_scores = logits.gather(1, class_tensor.view(-1, 1)).sum()
-        target_scores.backward()
+    if class_names is not None:
+        print(f"Prediction: {class_names[pred_idx]} ({pred_prob:.3f})")
+    else:
+        print(f"Prediction: class {pred_idx} ({pred_prob:.3f})")
 
-        if self.activations is None or self.gradients is None:
-            raise RuntimeError("Grad-CAM hooks did not capture activations and gradients.")
-
-        weights = self.gradients.mean(dim=(2, 3), keepdim=True)
-        cam_map = (weights * self.activations).sum(dim=1, keepdim=True)
-        cam_map = F.relu(cam_map)
-        cam_map = F.interpolate(
-            cam_map,
-            size=input_tensor.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        cam_min = cam_map.amin(dim=(2, 3), keepdim=True)
-        cam_max = cam_map.amax(dim=(2, 3), keepdim=True)
-        cam_map = (cam_map - cam_min) / (cam_max - cam_min + 1e-8)
-
-        if was_training:
-            self.model.train()
-
-        return cam_map.squeeze(1).detach(), class_tensor.detach(), logits.detach()
+    return cam, pred_idx, pred_prob, image_np
 
 
-def denormalize_grayscale(
-    image_tensor: torch.Tensor,
-    mean: float = 0.5,
-    std: float = 0.5,
-) -> np.ndarray:
-    """Undo the FER normalization and return a 2D numpy image in [0, 1]."""
-    image = image_tensor.detach().cpu().float()
-    if image.ndim == 4:
-        image = image[0]
-    if image.ndim == 3:
-        image = image[0]
-    image = (image * std) + mean
-    return image.clamp(0.0, 1.0).numpy()
+def show_gradcam(image_np, cam, alpha=0.35, cmap="jet"):
+    """Overlay Grad-CAM heatmap on grayscale image."""
+    image_rgb = np.repeat(image_np[..., None], 3, axis=2)
+    heatmap = cm.get_cmap(cmap)(cam)[..., :3]
+    overlay = (1 - alpha) * image_rgb + alpha * heatmap
+    overlay = np.clip(overlay, 0, 1)
 
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
-def overlay_cam_on_grayscale(
-    image: np.ndarray,
-    cam_map: np.ndarray,
-    alpha: float = 0.35,
-    cmap: str = "jet",
-) -> np.ndarray:
-    """Blend a Grad-CAM heatmap onto a grayscale image."""
-    image = np.asarray(image, dtype=np.float32)
-    cam_map = np.asarray(cam_map, dtype=np.float32)
+    axes[0].imshow(image_np, cmap="gray")
+    axes[0].set_title("Original")
+    axes[0].axis("off")
 
-    image_rgb = np.repeat(image[..., None], 3, axis=2)
-    color_map = cm.get_cmap(cmap)(cam_map)[..., :3]
-    overlay = ((1.0 - alpha) * image_rgb) + (alpha * color_map)
-    return np.clip(overlay, 0.0, 1.0)
+    axes[1].imshow(cam, cmap=cmap)
+    axes[1].set_title("Grad-CAM")
+    axes[1].axis("off")
+
+    axes[2].imshow(overlay)
+    axes[2].set_title("Overlay")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.show()
 
 
 def visualize_gradcam_samples(
-    model: nn.Module,
+    model,
     dataset,
-    class_names: Sequence[str],
-    device: torch.device | str,
-    indices: Optional[Sequence[int]] = None,
-    num_samples: int = 6,
-    target_layer: Optional[nn.Module] = None,
-    mean: float = 0.5,
-    std: float = 0.5,
-    alpha: float = 0.35,
-    cmap: str = "jet",
-) -> plt.Figure:
-    """Plot original images, Grad-CAM maps, and overlays for dataset samples."""
+    class_names,
+    device,
+    indices=None,
+    num_samples=6,
+    target_layer=None,
+    alpha=0.35,
+    cmap="jet",
+):
+    """Plot original images, Grad-CAM heatmaps, and overlays for sample indices."""
+    if target_layer is None:
+        target_layer = get_default_target_layer(model)
+
     if indices is None:
-        num_samples = min(num_samples, len(dataset))
-        indices = list(range(num_samples))
-    if not indices:
-        raise ValueError("indices must contain at least one dataset index.")
+        indices = list(range(min(num_samples, len(dataset))))
 
-    device = torch.device(device)
-    was_training = model.training
-    model.eval()
+    fig, axes = plt.subplots(len(indices), 3, figsize=(12, 4 * len(indices)))
+    if len(indices) == 1:
+        axes = np.expand_dims(axes, axis=0)
 
-    with GradCAM(model, target_layer=target_layer) as gradcam:
-        fig, axes = plt.subplots(len(indices), 3, figsize=(12, 4 * len(indices)))
-        if len(indices) == 1:
-            axes = np.expand_dims(axes, axis=0)
+    for row, index in enumerate(indices):
+        image, label = dataset[index]
+        cam, pred_idx, pred_prob, image_np = gradcam_one_image(
+            model=model,
+            image_tensor=image,
+            target_layer=target_layer,
+            class_names=class_names,
+            device=device,
+        )
 
-        for row, index in enumerate(indices):
-            image, label = dataset[index]
-            if torch.is_tensor(label):
-                label_idx = int(label.item())
-            else:
-                label_idx = int(label)
+        image_rgb = np.repeat(image_np[..., None], 3, axis=2)
+        heatmap = cm.get_cmap(cmap)(cam)[..., :3]
+        overlay = np.clip((1 - alpha) * image_rgb + alpha * heatmap, 0, 1)
 
-            input_tensor = image.unsqueeze(0).to(device)
-            cam_map, pred_idx, logits = gradcam.generate(input_tensor)
-            probs = logits.softmax(dim=1)[0]
+        label_idx = int(label.item()) if torch.is_tensor(label) else int(label)
 
-            pred_idx_int = int(pred_idx.item())
-            pred_prob = float(probs[pred_idx_int].item())
-            image_np = denormalize_grayscale(image, mean=mean, std=std)
-            cam_np = cam_map[0].cpu().numpy()
-            overlay_np = overlay_cam_on_grayscale(image_np, cam_np, alpha=alpha, cmap=cmap)
+        axes[row, 0].imshow(image_np, cmap="gray")
+        axes[row, 0].set_title(f"Original\nTrue: {class_names[label_idx]}")
+        axes[row, 0].axis("off")
 
-            axes[row, 0].imshow(image_np, cmap="gray")
-            axes[row, 0].set_title(f"Original\nTrue: {class_names[label_idx]}")
-            axes[row, 0].axis("off")
+        axes[row, 1].imshow(cam, cmap=cmap)
+        axes[row, 1].set_title(f"Grad-CAM\nPred: {class_names[pred_idx]} ({pred_prob:.1%})")
+        axes[row, 1].axis("off")
 
-            axes[row, 1].imshow(cam_np, cmap=cmap)
-            axes[row, 1].set_title(
-                f"Grad-CAM\nPred: {class_names[pred_idx_int]} ({pred_prob:.1%})"
-            )
-            axes[row, 1].axis("off")
+        axes[row, 2].imshow(overlay)
+        axes[row, 2].set_title("Overlay")
+        axes[row, 2].axis("off")
 
-            axes[row, 2].imshow(overlay_np)
-            axes[row, 2].set_title("Overlay")
-            axes[row, 2].axis("off")
-
-        plt.tight_layout()
-
-    if was_training:
-        model.train()
-
+    plt.tight_layout()
     return fig
 
 
-__all__ = [
-    "GradCAM",
-    "denormalize_grayscale",
-    "get_last_conv_layer",
-    "overlay_cam_on_grayscale",
-    "visualize_gradcam_samples",
-]
+def compare_gradcam_methods(
+    model,
+    dataset,
+    class_names,
+    device,
+    indices=None,
+    num_samples=3,
+    target_layer=None,
+    alpha=0.35,
+    cmap="jet",
+):
+    """Compare this notebook's Grad-CAM against pytorch-grad-cam.
 
+    Both methods explain the same predicted class on the same image and layer so
+    the visual differences are easier to interpret.
+    """
+    try:
+        from pytorch_grad_cam import GradCAM as TorchGradCAM
+        from pytorch_grad_cam.utils.image import show_cam_on_image
+        from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    except ImportError as exc:
+        raise ImportError(
+            "pytorch-grad-cam is not installed. Install it with `%pip install grad-cam` "
+            "and rerun this comparison cell."
+        ) from exc
+
+    if target_layer is None:
+        target_layer = get_default_target_layer(model)
+
+    if indices is None:
+        indices = list(range(min(num_samples, len(dataset))))
+
+    cam_helper = TorchGradCAM(model=model, target_layers=[target_layer])
+    fig, axes = plt.subplots(len(indices), 5, figsize=(18, 4 * len(indices)))
+    if len(indices) == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for row, index in enumerate(indices):
+        image, label = dataset[index]
+        custom_cam, pred_idx, pred_prob, image_np = gradcam_one_image(
+            model=model,
+            image_tensor=image,
+            target_layer=target_layer,
+            class_names=None,
+            device=device,
+        )
+
+        input_tensor = image.unsqueeze(0).to(device)
+        targets = [ClassifierOutputTarget(pred_idx)]
+        torch_cam = cam_helper(input_tensor=input_tensor, targets=targets)[0]
+
+        image_rgb = np.repeat(image_np[..., None], 3, axis=2).astype(np.float32)
+        custom_heatmap = cm.get_cmap(cmap)(custom_cam)[..., :3]
+        custom_overlay = np.clip((1 - alpha) * image_rgb + alpha * custom_heatmap, 0, 1)
+        torch_overlay = show_cam_on_image(image_rgb, torch_cam.astype(np.float32), use_rgb=True)
+
+        label_idx = int(label.item()) if torch.is_tensor(label) else int(label)
+
+        axes[row, 0].imshow(image_np, cmap="gray")
+        axes[row, 0].set_title(
+            f"Original\nTrue: {class_names[label_idx]}\nPred: {class_names[pred_idx]} ({pred_prob:.1%})"
+        )
+        axes[row, 0].axis("off")
+
+        axes[row, 1].imshow(custom_cam, cmap=cmap)
+        axes[row, 1].set_title("Custom CAM")
+        axes[row, 1].axis("off")
+
+        axes[row, 2].imshow(custom_overlay)
+        axes[row, 2].set_title("Custom Overlay")
+        axes[row, 2].axis("off")
+
+        axes[row, 3].imshow(torch_cam, cmap=cmap)
+        axes[row, 3].set_title("pytorch-grad-cam")
+        axes[row, 3].axis("off")
+
+        axes[row, 4].imshow(torch_overlay)
+        axes[row, 4].set_title("Library Overlay")
+        axes[row, 4].axis("off")
+
+    plt.tight_layout()
+    return fig
