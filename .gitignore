@@ -1,5 +1,6 @@
 fer2013/*
-
+imagenet_face_model.pth
+*.pth
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
