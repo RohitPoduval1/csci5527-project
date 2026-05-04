@@ -96,6 +96,74 @@ def _matches_class(record_value_idx: int, record_value_name: str, emotion: int |
     return record_value_name == emotion
 
 
+def rank_prediction_records(
+    records: Iterable[PredictionRecord],
+    correct: bool | None = None,
+    top_k: int = 5,
+    sort_by: str = "predicted_confidence",
+    true_emotion: int | str | None = None,
+    predicted_emotion: int | str | None = None,
+    descending: bool = True,
+) -> list[PredictionRecord]:
+    """Return the highest- or lowest-ranked prediction records overall."""
+
+    filtered_records = [
+        record
+        for record in records
+        if (correct is None or record.correct == correct)
+        and _matches_class(record.true_idx, record.true_name, true_emotion)
+        and _matches_class(record.pred_idx, record.pred_name, predicted_emotion)
+    ]
+
+    return sorted(
+        filtered_records,
+        key=lambda record: _sort_key(record, sort_by),
+        reverse=descending,
+    )[:top_k]
+
+
+def top_prediction_records(
+    records: Iterable[PredictionRecord],
+    correct: bool | None = None,
+    top_k: int = 5,
+    sort_by: str = "predicted_confidence",
+    true_emotion: int | str | None = None,
+    predicted_emotion: int | str | None = None,
+) -> list[PredictionRecord]:
+    """Return the most confident prediction records after optional filtering."""
+
+    return rank_prediction_records(
+        records=records,
+        correct=correct,
+        top_k=top_k,
+        sort_by=sort_by,
+        true_emotion=true_emotion,
+        predicted_emotion=predicted_emotion,
+        descending=True,
+    )
+
+
+def bottom_prediction_records(
+    records: Iterable[PredictionRecord],
+    correct: bool | None = None,
+    top_k: int = 5,
+    sort_by: str = "predicted_confidence",
+    true_emotion: int | str | None = None,
+    predicted_emotion: int | str | None = None,
+) -> list[PredictionRecord]:
+    """Return the least confident prediction records after optional filtering."""
+
+    return rank_prediction_records(
+        records=records,
+        correct=correct,
+        top_k=top_k,
+        sort_by=sort_by,
+        true_emotion=true_emotion,
+        predicted_emotion=predicted_emotion,
+        descending=False,
+    )
+
+
 def collect_prediction_records(
     model,
     dataset,
@@ -195,15 +263,59 @@ def top_samples_for_emotion(
         predicted_emotion: Optional predicted class filter for wrong examples.
     """
 
-    filtered_records = [
-        record
-        for record in records
-        if record.correct == correct
-        and _matches_class(record.true_idx, record.true_name, emotion)
-        and _matches_class(record.pred_idx, record.pred_name, predicted_emotion)
-    ]
+    return top_prediction_records(
+        records=records,
+        correct=correct,
+        top_k=top_k,
+        sort_by=sort_by,
+        true_emotion=emotion,
+        predicted_emotion=predicted_emotion,
+    )
 
-    return sorted(filtered_records, key=lambda record: _sort_key(record, sort_by), reverse=True)[:top_k]
+
+def bottom_samples_for_emotion(
+    records: Iterable[PredictionRecord],
+    emotion: int | str,
+    correct: bool,
+    top_k: int = 5,
+    sort_by: str = "predicted_confidence",
+    predicted_emotion: int | str | None = None,
+) -> list[PredictionRecord]:
+    """Return the least confident correct or incorrect samples for one true class."""
+
+    return bottom_prediction_records(
+        records=records,
+        correct=correct,
+        top_k=top_k,
+        sort_by=sort_by,
+        true_emotion=emotion,
+        predicted_emotion=predicted_emotion,
+    )
+
+
+def rank_samples_by_true_class(
+    records: Iterable[PredictionRecord],
+    correct: bool,
+    top_k: int = 5,
+    sort_by: str = "predicted_confidence",
+    descending: bool = True,
+) -> dict[str, list[PredictionRecord]]:
+    """Group the highest- or lowest-ranked samples by true emotion."""
+
+    records = list(records)
+    classes = sorted({(record.true_idx, record.true_name) for record in records}, key=lambda item: item[0])
+
+    return {
+        class_name: rank_prediction_records(
+            records=records,
+            correct=correct,
+            top_k=top_k,
+            sort_by=sort_by,
+            true_emotion=class_name,
+            descending=descending,
+        )
+        for _, class_name in classes
+    }
 
 
 def top_samples_by_true_class(
@@ -214,19 +326,30 @@ def top_samples_by_true_class(
 ) -> dict[str, list[PredictionRecord]]:
     """Group the top confident correct or incorrect samples by true emotion."""
 
-    records = list(records)
-    classes = sorted({(record.true_idx, record.true_name) for record in records}, key=lambda item: item[0])
+    return rank_samples_by_true_class(
+        records=records,
+        correct=correct,
+        top_k=top_k,
+        sort_by=sort_by,
+        descending=True,
+    )
 
-    return {
-        class_name: top_samples_for_emotion(
-            records=records,
-            emotion=class_name,
-            correct=correct,
-            top_k=top_k,
-            sort_by=sort_by,
-        )
-        for _, class_name in classes
-    }
+
+def bottom_samples_by_true_class(
+    records: Iterable[PredictionRecord],
+    correct: bool,
+    top_k: int = 5,
+    sort_by: str = "predicted_confidence",
+) -> dict[str, list[PredictionRecord]]:
+    """Group the least confident correct or incorrect samples by true emotion."""
+
+    return rank_samples_by_true_class(
+        records=records,
+        correct=correct,
+        top_k=top_k,
+        sort_by=sort_by,
+        descending=False,
+    )
 
 
 def prediction_records_to_rows(records: Iterable[PredictionRecord]) -> list[dict]:
@@ -336,10 +459,16 @@ def plot_ranked_samples_by_class(
 
 
 __all__ = [
+    "bottom_prediction_records",
+    "bottom_samples_by_true_class",
+    "bottom_samples_for_emotion",
     "PredictionRecord",
     "collect_prediction_records",
     "plot_ranked_samples_by_class",
     "prediction_records_to_rows",
+    "rank_prediction_records",
+    "rank_samples_by_true_class",
+    "top_prediction_records",
     "top_samples_by_true_class",
     "top_samples_for_emotion",
 ]
