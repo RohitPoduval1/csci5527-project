@@ -5,6 +5,7 @@ imagenet_face_model.pth
 __pycache__/
 *.py[codz]
 *$py.class
+.DS_Store
 
 # C extensions
 *.so
