@@ -1,5 +1,18 @@
 # CSCI 5527 Project
 
+<!-- BEGIN portfolio-project-animations -->
+## Animated project guide
+
+These self-contained SVG animations explain the project workflow. They are illustrative guides, not recorded experiments or new performance results. Static content remains available when reduced motion is requested.
+
+### Representation and attention
+
+![Representation and attention — illustrative animation](docs/portfolio-animations/facial-expression-recognition.svg)
+
+Conceptual CNN and attention regions, not a real Grad-CAM map or a demonstrated accuracy improvement.
+
+<!-- END portfolio-project-animations -->
+
 ## Colab Instructions
 
 ### Getting the Data
